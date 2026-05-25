@@ -673,7 +673,7 @@ if st.sidebar.button("🚪 Logout"):
 # ====================== HELPER FUNCTION: GET RECENTLY UPDATED TASKS ======================
 def get_recent_task_updates(hours=24):
     """Fetch tasks updated in the last N hours with employee details"""
-    cutoff_time = datetime.now() - timedelta(hours=hours)
+    cutoff_time = (datetime.now() - timedelta(hours=hours)).replace(tzinfo=None)
     tasks_df = get_tasks_df()
     users_df = get_users_df()
 
@@ -694,7 +694,7 @@ def get_recent_task_updates(hours=24):
         recent_tasks["status"].isin(["In Progress", "Need Help", "Work Completed"])
     ].copy()
 
-    recent_tasks["assigned_date"] = pd.to_datetime(recent_tasks["timestamp"], errors="coerce")
+    recent_tasks["assigned_date"] = pd.to_datetime(recent_tasks["timestamp"], errors="coerce").dt.tz_localize(None)
     recent_tasks = recent_tasks[recent_tasks["assigned_date"] >= cutoff_time].copy()
     recent_tasks["updated_time"] = recent_tasks["assigned_date"]
     recent_tasks = recent_tasks.sort_values("id", ascending=False).head(20)
