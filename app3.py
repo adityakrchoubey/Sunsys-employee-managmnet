@@ -7,8 +7,10 @@ from pathlib import Path
 from PIL import Image
 import uuid
 import base64
-import json   
+import json
 import secrets
+import hashlib
+import urllib.request
 from urllib.parse import urlparse, urlunparse
 try:
     from supabase import create_client
@@ -18,7 +20,6 @@ except ModuleNotFoundError:
     SUPABASE_AVAILABLE = False
 
 # 1. PATH SETUP
-# Use an absolute data folder next to this script so the DB persists across restarts
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_FOLDER, exist_ok=True)
@@ -27,6 +28,9 @@ ATTACHMENT_PATH = os.path.join(DATA_FOLDER, "attachments")
 os.makedirs(ATTACHMENT_PATH, exist_ok=True)
 
 supabase = None
+SUPABASE_ENABLED = False
+SUPABASE_BUCKET_NAME = "attachments"
+
 if SUPABASE_AVAILABLE:
     try:
         raw_supabase_url = st.secrets.get("SUPABASE_URL", "").rstrip("/")
@@ -40,50 +44,57 @@ if SUPABASE_AVAILABLE:
             raw_supabase_url,
             st.secrets.get("SUPABASE_KEY", "")
         )
+        SUPABASE_ENABLED = True
+        SUPABASE_BUCKET_NAME = str(st.secrets.get("SUPABASE_BUCKET", "attachments")).strip() or "attachments"
     except Exception as e:
         supabase = None
+        SUPABASE_ENABLED = False
         st.warning(f"Supabase client initialization failed: {e}")
 else:
     st.warning("Python package 'supabase' is not installed. Supabase features are disabled. Install with `pip install supabase` or add it to requirements.txt before deploying.")
+
 
 # 2. UPDATED GET_DB
 def get_db():
     return sqlite3.connect(DB_PATH)
 
+
 # 3. DATABASE INITIALIZATION FUNCTION
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    # Create Users Table
     c.execute('''CREATE TABLE IF NOT EXISTS users (
-                 username TEXT PRIMARY KEY, 
-                 password TEXT, 
-                 full_name TEXT, 
-                 dept TEXT, 
-                 designation TEXT, 
-                 phone TEXT, 
+                 username TEXT PRIMARY KEY,
+                 password TEXT,
+                 full_name TEXT,
+                 dept TEXT,
+                 designation TEXT,
+                 phone TEXT,
                  role TEXT)''')
-    
-    # Insert Default Admin if not exists
-    c.execute("""INSERT OR IGNORE INTO users (username, password, full_name, dept, designation, phone, role) 
+
+    c.execute("""INSERT OR IGNORE INTO users (username, password, full_name, dept, designation, phone, role)
                  VALUES (?,?,?,?,?,?,?)""",
               ("admin", "admin2026", "HR Manager", "HR & Admin", "HR Head", "", "Admin"))
-    
-    # Create Tasks Table
+
     c.execute('''CREATE TABLE IF NOT EXISTS tasks (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 description TEXT, assigned_to TEXT, dept TEXT,
-                 status TEXT, priority TEXT, frequency TEXT,
-                 due_date TEXT, due_time TEXT, admin_file TEXT, 
-                 emp_remark TEXT, emp_screenshot TEXT, timestamp TEXT)''')
-    
+                 description TEXT,
+                 assigned_to TEXT,
+                 dept TEXT,
+                 status TEXT,
+                 priority TEXT,
+                 frequency TEXT,
+                 due_date TEXT,
+                 due_time TEXT,
+                 admin_file TEXT,
+                 emp_remark TEXT,
+                 emp_screenshot TEXT,
+                 timestamp TEXT,
+                 admin_files_json TEXT DEFAULT '[]',
+                 emp_files_json TEXT DEFAULT '[]')''')
+
     conn.commit()
     conn.close()
-
-# 4. CRITICAL: TRIGGER INITIALIZATION
-# This must run before the login_page() call
-init_db()
-# ===================================================================
 
 
 # Ensure attachments folder exists (do not delete files on restart)
@@ -91,62 +102,420 @@ os.makedirs(ATTACHMENT_PATH, exist_ok=True)
 
 
 # ====================== DATABASE SETUP ======================
-# Second init_db removed to prevent duplicate definitions
-
-# ====================== HELPER FUNCTION TO MIGRATE DB ======================
 def migrate_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Add due_time column if it doesn't exist
     try:
         c.execute("ALTER TABLE tasks ADD COLUMN due_time TEXT")
-    except:
+    except Exception:
         pass
-    # Add columns for multiple file storage as JSON
     try:
         c.execute("ALTER TABLE tasks ADD COLUMN admin_files_json TEXT DEFAULT '[]'")
-    except:
+    except Exception:
         pass
     try:
         c.execute("ALTER TABLE tasks ADD COLUMN emp_files_json TEXT DEFAULT '[]'")
-    except:
+    except Exception:
         pass
     conn.commit()
     conn.close()
 
-migrate_db()
-    
 
-def get_supabase_public_url(file_name):
-    if not supabase:
-        raise RuntimeError("Supabase client is not initialized. Install 'supabase' package and set SUPABASE_URL and SUPABASE_KEY in Streamlit secrets.")
-    response = supabase.storage.from_("attachments").get_public_url(file_name)
-    if isinstance(response, dict):
-        return response.get("publicUrl") or response.get("data", {}).get("publicUrl")
-    if hasattr(response, "data") and response.data:
-        return response.data.get("publicUrl")
+# ====================== SECURITY HELPERS ======================
+def hash_password(password):
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return f"pbkdf2$sha256${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password, stored_password):
+    if not stored_password:
+        return False
+    if isinstance(stored_password, str) and stored_password.startswith("pbkdf2$"):
+        try:
+            _, algo, salt_hex, digest_hex = stored_password.split("$")
+            salt = bytes.fromhex(salt_hex)
+            expected = hashlib.pbkdf2_hmac(algo.replace("sha256", "sha256"), password.encode("utf-8"), salt, 200_000).hex()
+            return secrets.compare_digest(expected, digest_hex)
+        except Exception:
+            return False
+    return stored_password == password
+
+
+def supabase_response_to_df(response):
+    data = getattr(response, "data", None)
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if data is None:
+        return pd.DataFrame()
+    if isinstance(data, dict):
+        return pd.DataFrame([data])
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    return pd.DataFrame([data])
+
+
+def get_users_df():
+    if SUPABASE_ENABLED:
+        try:
+            return supabase_response_to_df(supabase.table("users").select("*").execute())
+        except Exception:
+            return pd.DataFrame(columns=["username", "password", "full_name", "dept", "designation", "phone", "role"])
+    return pd.read_sql("SELECT * FROM users", get_db())
+
+
+def get_tasks_df():
+    if SUPABASE_ENABLED:
+        try:
+            return supabase_response_to_df(supabase.table("tasks").select("*").execute())
+        except Exception:
+            return pd.DataFrame(columns=["id", "description", "assigned_to", "dept", "status", "priority", "frequency", "due_date", "due_time", "admin_file", "emp_remark", "emp_screenshot", "timestamp", "admin_files_json", "emp_files_json"])
+    return pd.read_sql("SELECT * FROM tasks", get_db())
+
+
+def get_user_record(username):
+    users_df = get_users_df()
+    if users_df.empty:
+        return None
+    match = users_df[users_df["username"] == username]
+    if match.empty:
+        return None
+    return match.iloc[0].to_dict()
+
+
+def authenticate_user(username, password):
+    user = get_user_record(username)
+    if not user:
+        return None
+    if verify_password(password, user.get("password")):
+        return user
     return None
 
 
+def ensure_supabase_seed_admin():
+    if not SUPABASE_ENABLED:
+        return
+    users_df = get_users_df()
+    if not users_df.empty and "username" in users_df.columns and (users_df["username"] == "admin").any():
+        return
+
+    try:
+        supabase.table("users").insert({
+            "username": "admin",
+            "password": hash_password("admin2026"),
+            "full_name": "HR Manager",
+            "dept": "HR & Admin",
+            "designation": "HR Head",
+            "phone": "",
+            "role": "Admin"
+        }).execute()
+    except Exception:
+        pass
+
+
+def ensure_supabase_tables():
+    if not SUPABASE_ENABLED:
+        return
+    ensure_supabase_seed_admin()
+
+
+def insert_user_record(full_name, username, password, dept, designation, phone):
+    if SUPABASE_ENABLED:
+        supabase.table("users").insert({
+            "username": username,
+            "password": hash_password(password),
+            "full_name": full_name,
+            "dept": dept,
+            "designation": designation,
+            "phone": phone,
+            "role": "Employee"
+        }).execute()
+        return
+
+    conn = get_db()
+    conn.execute("""INSERT INTO users
+                     (username, password, full_name, dept, designation, phone, role)
+                     VALUES (?,?,?,?,?,?,?)""",
+                 (username, password, full_name, dept, designation, phone, "Employee"))
+    conn.commit()
+    conn.close()
+
+
+def delete_user_record(username):
+    if SUPABASE_ENABLED:
+        supabase.table("users").delete().eq("username", username).execute()
+        supabase.table("tasks").delete().eq("assigned_to", username).execute()
+        return
+
+    conn = get_db()
+    conn.execute("DELETE FROM users WHERE username=?", (username,))
+    conn.execute("DELETE FROM tasks WHERE assigned_to=?", (username,))
+    conn.commit()
+    conn.close()
+
+
+def update_user_password_record(username, new_password):
+    if SUPABASE_ENABLED:
+        supabase.table("users").update({"password": hash_password(new_password)}).eq("username", username).execute()
+        return
+
+    conn = get_db()
+    conn.execute("UPDATE users SET password=? WHERE username=?", (new_password, username))
+    conn.commit()
+    conn.close()
+
+
+def insert_task_record(description, assigned_to, dept, priority, frequency, due_date, due_time, admin_files_json):
+    first_admin_file = json.loads(admin_files_json)[0] if admin_files_json and json.loads(admin_files_json) else ""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    if SUPABASE_ENABLED:
+        supabase.table("tasks").insert({
+            "description": description,
+            "assigned_to": assigned_to,
+            "dept": dept,
+            "status": "Pending",
+            "priority": priority,
+            "frequency": frequency,
+            "due_date": due_date,
+            "due_time": due_time,
+            "admin_file": first_admin_file,
+            "admin_files_json": admin_files_json,
+            "emp_remark": "",
+            "emp_screenshot": "",
+            "timestamp": timestamp,
+            "emp_files_json": "[]"
+        }).execute()
+        return
+
+    conn = get_db()
+    conn.execute("""INSERT INTO tasks
+                     (description, assigned_to, dept, status, priority, frequency, due_date, due_time, admin_file, admin_files_json, timestamp, emp_remark, emp_screenshot, emp_files_json)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (description, assigned_to, dept, "Pending", priority, frequency, due_date, due_time, first_admin_file, admin_files_json, timestamp, "", "", "[]"))
+    conn.commit()
+    conn.close()
+
+
+def update_task_record(task_id, description, status, priority, due_date):
+    if SUPABASE_ENABLED:
+        supabase.table("tasks").update({
+            "description": description,
+            "status": status,
+            "priority": priority,
+            "due_date": due_date
+        }).eq("id", task_id).execute()
+        return
+
+    conn = get_db()
+    conn.execute("""UPDATE tasks SET description=?, status=?, priority=?, due_date=? WHERE id=?""",
+                 (description, status, priority, due_date, task_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_task_record(task_id):
+    if SUPABASE_ENABLED:
+        supabase.table("tasks").delete().eq("id", task_id).execute()
+        return
+
+    conn = get_db()
+    conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+
+
+def update_task_progress(task_id, status, remark, first_emp_file, emp_files_json):
+    if SUPABASE_ENABLED:
+        supabase.table("tasks").update({
+            "status": status,
+            "emp_remark": remark,
+            "emp_screenshot": first_emp_file,
+            "emp_files_json": emp_files_json
+        }).eq("id", task_id).execute()
+        return
+
+    conn = get_db()
+    conn.execute("UPDATE tasks SET status=?, emp_remark=?, emp_screenshot=?, emp_files_json=? WHERE id=?",
+                 (status, remark, first_emp_file, emp_files_json, task_id))
+    conn.commit()
+    conn.close()
+
+
+def get_task_row(task_id):
+    tasks_df = get_tasks_df()
+    if tasks_df.empty:
+        return None
+    row = tasks_df[tasks_df["id"] == task_id]
+    if row.empty:
+        return None
+    return row.iloc[0].to_dict()
+
+
+def get_employee_rows():
+    users_df = get_users_df()
+    if users_df.empty or "role" not in users_df.columns:
+        return pd.DataFrame(columns=users_df.columns)
+    return users_df[users_df["role"] == "Employee"].copy()
+
+
+def get_tasks_for_user(username):
+    tasks_df = get_tasks_df()
+    if tasks_df.empty or "assigned_to" not in tasks_df.columns:
+        return pd.DataFrame(columns=tasks_df.columns)
+    return tasks_df[tasks_df["assigned_to"] == username].copy()
+
+
+def is_storage_ref(value):
+    return isinstance(value, str) and value.startswith("storage://")
+
+
+def parse_storage_ref(value):
+    if not is_storage_ref(value):
+        return None, None
+    raw = value[len("storage://"):]
+    bucket, path = raw.split("/", 1)
+    return bucket, path
+
+
+def make_storage_ref(bucket_name, path):
+    return f"storage://{bucket_name}/{path}"
+
+
+def ensure_supabase_bucket():
+    if not SUPABASE_ENABLED:
+        raise RuntimeError("Supabase is not enabled")
+
+    bucket_name = SUPABASE_BUCKET_NAME
+    try:
+        supabase.storage.get_bucket(bucket_name)
+        return bucket_name
+    except Exception:
+        create_response = supabase.storage.create_bucket(bucket_name, {"public": False})
+        if isinstance(create_response, dict) and create_response.get("error"):
+            raise RuntimeError(create_response["error"])
+        return bucket_name
+
+
+def get_supabase_signed_url(file_ref):
+    if not is_storage_ref(file_ref):
+        return file_ref
+    bucket_name, path = parse_storage_ref(file_ref)
+    response = supabase.storage.from_(bucket_name).create_signed_url(path, 3600)
+    if isinstance(response, dict):
+        if response.get("error"):
+            raise RuntimeError(response["error"])
+        return response.get("signedURL") or response.get("data", {}).get("signedURL")
+    if hasattr(response, "data") and response.data:
+        return response.data.get("signedURL")
+    return None
+
+
+def download_storage_bytes(file_ref):
+    signed_url = get_supabase_signed_url(file_ref)
+    with urllib.request.urlopen(signed_url) as response:
+        return response.read()
+
+
+def get_attachment_name(file_ref):
+    if is_storage_ref(file_ref):
+        _, path = parse_storage_ref(file_ref)
+        return os.path.basename(path)
+    if isinstance(file_ref, str):
+        return os.path.basename(file_ref)
+    return "attachment"
+
+
+def render_attachment(file_ref, key_prefix, allow_link=False):
+    if is_storage_ref(file_ref):
+        name = get_attachment_name(file_ref)
+        signed_url = get_supabase_signed_url(file_ref)
+        if allow_link and signed_url:
+            st.markdown(f"[📄 {name}]({signed_url})")
+        else:
+            st.write(f"📄 {name}")
+        try:
+            st.download_button(
+                label="⬇️ Download",
+                data=download_storage_bytes(file_ref),
+                file_name=name,
+                key=f"{key_prefix}_{name}"
+            )
+        except Exception:
+            st.write("Unable to download")
+        return
+
+    if isinstance(file_ref, str) and file_ref.startswith("http"):
+        st.markdown(f"[📄 {get_attachment_name(file_ref)}]({file_ref})")
+        return
+
+    if isinstance(file_ref, str) and os.path.exists(file_ref):
+        name = get_attachment_name(file_ref)
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.write(f"📄 {name}")
+        with col2:
+            try:
+                with open(file_ref, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download",
+                        data=f.read(),
+                        file_name=name,
+                        key=f"{key_prefix}_{name}"
+                    )
+            except Exception:
+                st.write("Unable to download")
+        return
+
+    if file_ref:
+        st.write(f"📄 {get_attachment_name(file_ref)}")
+
+
 def save_file_to_supabase(uploaded_file, prefix):
-    if not supabase:
-        raise RuntimeError("Supabase client is not initialized. Cannot upload files. Install 'supabase' and configure secrets.")
-    file_name = uploaded_file.name
+    if not SUPABASE_ENABLED:
+        raise RuntimeError("Supabase is not enabled. Configure SUPABASE_URL and SUPABASE_KEY.")
+
+    bucket_name = ensure_supabase_bucket()
+    file_name = Path(uploaded_file.name).name
     file_ext = Path(file_name).suffix
     unique_name = f"{prefix}_{secrets.token_hex(10)}{file_ext}"
     file_bytes = uploaded_file.getvalue()
-    upload_response = supabase.storage.from_("attachments").upload(
+    upload_response = supabase.storage.from_(bucket_name).upload(
         unique_name,
         file_bytes,
         {"content-type": getattr(uploaded_file, "type", "application/octet-stream")}
     )
     if isinstance(upload_response, dict) and upload_response.get("error"):
         raise RuntimeError(upload_response["error"])
-    public_url = get_supabase_public_url(unique_name)
-    if not public_url:
-        raise RuntimeError("Failed to get Supabase public URL")
-    return public_url
 
+    return make_storage_ref(bucket_name, unique_name)
+
+
+def save_file_to_local(uploaded_file, prefix):
+    file_name = Path(uploaded_file.name).name
+    file_ext = Path(file_name).suffix
+    unique_name = f"{prefix}_{uuid.uuid4().hex[:8]}{file_ext}"
+    local_path = os.path.join(ATTACHMENT_PATH, unique_name)
+    with open(local_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
+    return local_path
+
+
+def save_uploaded_file(uploaded_file, prefix):
+    if SUPABASE_ENABLED:
+        try:
+            return save_file_to_supabase(uploaded_file, prefix)
+        except Exception as e:
+            raise RuntimeError(f"Supabase upload failed: {e}")
+    return save_file_to_local(uploaded_file, prefix)
+
+
+# 4. CRITICAL: TRIGGER INITIALIZATION
+if SUPABASE_ENABLED:
+    ensure_supabase_tables()
+else:
+    init_db()
+    migrate_db()
 
 # ====================== HELPER FUNCTION TO DISPLAY PDF (New Feature) ======================
 def display_pdf(pdf_path):
@@ -165,6 +534,10 @@ def display_pdf(pdf_path):
 
 # ====================== ATTRACTIVE UI/UX STYLING ======================
 st.set_page_config(page_title="SunSys ERP", page_icon="☀️", layout="wide")
+
+if not SUPABASE_ENABLED:
+    st.error("Secure mode requires Supabase. Add SUPABASE_URL, SUPABASE_KEY, and install the `supabase` package to continue.")
+    st.stop()
 
 st.markdown("""
     <style>
@@ -208,8 +581,8 @@ import streamlit.components.v1 as components
 col1, col2, col3 = st.columns([1.2, 3.5, 2.2])
 
 with col1:
-    if os.path.exists("sunsys logo.png"):
-        st.image("sunsys logo.png", width=200)
+    if os.path.exists("sunsys logo.jpeg"):
+        st.image("sunsys logo.jpeg", width=200)
     else:
         st.title("☀️ SunSys")
 
@@ -250,51 +623,44 @@ with col3:
 if "auth" not in st.session_state:
     st.session_state.update({"auth": False, "role": None, "user": None, "dept": None})
 
+
 def login_page():
     st.markdown("<h2 style='text-align:center; color:#1C4694;'>🔐 Department Center Login</h2>", unsafe_allow_html=True)
     with st.container(border=True):
         role = st.radio("Select Access Type", ["Employee", "HR Admin"], horizontal=True)
-        
+
         if role == "HR Admin":
             username = st.text_input("Admin Username")
             password = st.text_input("Password", type="password")
             if st.button("Enter HR Command Center", use_container_width=True):
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    result = conn.execute("SELECT dept FROM users WHERE username=? AND password=? AND role='Admin'", 
-                                        (username.strip(), password.strip())).fetchone()
-                    if result:
-                        st.session_state.update({"auth": True, "role": "Admin", "user": username})
-                        st.rerun()
-                    else:
-                        st.error("❌ Invalid Admin Credentials")
-                finally:
-                    conn.close()
-        
+                user = authenticate_user(username.strip(), password.strip())
+                if user and user.get("role") == "Admin":
+                    st.session_state.update({"auth": True, "role": "Admin", "user": username})
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid Admin Credentials")
+
         else:
             username = st.text_input("Employee Username")
             password = st.text_input("Password", type="password")
-            selected_dept = st.selectbox("Choose Your Department Center", 
-                                       ["Solar Installation", "Technical Support", "Sales & Marketing", "HR & Admin", "Accounts"])
-            
+            selected_dept = st.selectbox(
+                "Choose Your Department Center",
+                ["Solar Installation", "Technical Support", "Sales & Marketing", "HR & Admin", "Accounts"]
+            )
+
             if st.button("Enter My Department Center", use_container_width=True):
-                try:
-                    conn = sqlite3.connect(DB_PATH)
-                    # Strip whitespace from inputs for comparison
-                    result = conn.execute("SELECT dept FROM users WHERE username=? AND password=? AND role='Employee'", 
-                                        (username.strip(), password.strip())).fetchone()
-                    if result:
-                        stored_dept = result[0].strip() if result[0] else ""
-                        selected_dept_clean = selected_dept.strip()
-                        if stored_dept == selected_dept_clean:
-                            st.session_state.update({"auth": True, "role": "Employee", "user": username, "dept": selected_dept})
-                            st.rerun()
-                        else:
-                            st.error(f"❌ Department mismatch. Your registered department is '{stored_dept}' but you selected '{selected_dept_clean}'")
+                user = authenticate_user(username.strip(), password.strip())
+                if user and user.get("role") == "Employee":
+                    stored_dept = (user.get("dept") or "").strip()
+                    selected_dept_clean = selected_dept.strip()
+                    if stored_dept == selected_dept_clean:
+                        st.session_state.update({"auth": True, "role": "Employee", "user": username, "dept": selected_dept})
+                        st.rerun()
                     else:
-                        st.error("❌ Invalid username or password")
-                finally:
-                    conn.close()
+                        st.error(f"❌ Department mismatch. Your registered department is '{stored_dept}' but you selected '{selected_dept_clean}'")
+                else:
+                    st.error("❌ Invalid username or password")
+
 
 if not st.session_state.auth:
     login_page()
@@ -307,28 +673,44 @@ if st.sidebar.button("🚪 Logout"):
 # ====================== HELPER FUNCTION: GET RECENTLY UPDATED TASKS ======================
 def get_recent_task_updates(hours=24):
     """Fetch tasks updated in the last N hours with employee details"""
-    cutoff_time = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M")
-    conn = get_db()
-    recent_tasks = pd.read_sql("""
-        SELECT 
-            t.id,
-            t.description,
-            t.assigned_to,
-            u.full_name,
-            t.status,
-            t.priority,
-            t.emp_remark,
-            t.timestamp as assigned_date,
-            CASE WHEN t.emp_remark != '' AND t.emp_remark IS NOT NULL THEN datetime('now') ELSE NULL END as updated_time
-        FROM tasks t
-        LEFT JOIN users u ON t.assigned_to = u.username
-        WHERE (t.emp_remark IS NOT NULL AND t.emp_remark != '')
-           OR (t.status IN ('In Progress', 'Need Help', 'Work Completed'))
-        ORDER BY t.id DESC
-        LIMIT 20
-    """, conn)
-    conn.close()
-    return recent_tasks
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    tasks_df = get_tasks_df()
+    users_df = get_users_df()
+
+    if tasks_df.empty or users_df.empty:
+        return pd.DataFrame()
+
+    recent_tasks = tasks_df.merge(
+        users_df[["username", "full_name"]],
+        left_on="assigned_to",
+        right_on="username",
+        how="left"
+    )
+    if recent_tasks.empty:
+        return pd.DataFrame()
+        
+    recent_tasks = recent_tasks[
+        (recent_tasks["emp_remark"].notna() & (recent_tasks["emp_remark"] != "")) |
+        recent_tasks["status"].isin(["In Progress", "Need Help", "Work Completed"])
+    ].copy()
+
+    recent_tasks["assigned_date"] = pd.to_datetime(recent_tasks["timestamp"], errors="coerce")
+    recent_tasks = recent_tasks[recent_tasks["assigned_date"] >= cutoff_time].copy()
+    recent_tasks["updated_time"] = recent_tasks["assigned_date"]
+    recent_tasks = recent_tasks.sort_values("id", ascending=False).head(20)
+
+    return recent_tasks[[
+        "id",
+        "description",
+        "assigned_to",
+        "full_name",
+        "status",
+        "priority",
+        "emp_remark",
+        "assigned_date",
+        "updated_time"
+    ]]
+
 
 def get_status_badge_color(status):
     """Return color based on task status"""
@@ -355,14 +737,19 @@ if st.session_state.role == "Admin":
             selected_dept = st.selectbox("📍 Select Department", ["Solar Installation", "Technical Support", "Sales & Marketing", "HR & Admin", "Accounts"], key="admin_dept_select")
         
         # Fetch employees based on selected department
-        emps_df = pd.read_sql("SELECT username, full_name FROM users WHERE role='Employee' AND dept=?", get_db(), params=(selected_dept,))
-        employee_list = [f"{row['full_name']} ({row['username']})" for _, row in emps_df.iterrows()]
+        emps_df = get_users_df()
+        if not emps_df.empty and "role" in emps_df.columns and "dept" in emps_df.columns:
+            emps_df = emps_df[(emps_df["role"] == "Employee") & (emps_df["dept"] == selected_dept)].copy()
+        else:
+            emps_df = pd.DataFrame(columns=["username", "full_name"])
         
         if emps_df.empty:
             st.warning(f"📍 No employees found in **{selected_dept}**.")
+            employee_list = []
         else:
             st.success(f"📍 Found **{len(emps_df)}** employee(s) in **{selected_dept}**")
             st.write(", ".join([row['full_name'] for _, row in emps_df.iterrows()]))
+            employee_list = [f"{row['full_name']} ({row['username']})" for _, row in emps_df.iterrows()]
         
         with st.form("assign_task", clear_on_submit=True):
             desc = st.text_area("Task Description", height=140)
@@ -371,7 +758,7 @@ if st.session_state.role == "Admin":
             # Department (hidden, using selected_dept from outside)
             dept = selected_dept
             
-            if emps_df.empty:
+            if emps_df.empty or not employee_list:
                 c2.write("No employees available for assignment.")
                 assigned_to = None
             else:
@@ -401,21 +788,20 @@ if st.session_state.role == "Admin":
                         if admin_file:
                             file_paths = []
                             for uploaded_file in admin_file:
-                                file_url = save_file_to_supabase(uploaded_file, f"admin_{uuid.uuid4().hex[:8]}")
-                                file_paths.append(file_url)
+                                file_path = save_uploaded_file(uploaded_file, f"admin_{uuid.uuid4().hex[:8]}")
+                                file_paths.append(file_path)
                             admin_files_json = json.dumps(file_paths)
-                        
-                        conn = get_db()
-                        conn.execute("""INSERT INTO tasks 
-                                     (description, assigned_to, dept, status, priority, frequency, due_date, due_time, admin_file, admin_files_json, timestamp)
-                                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                                     (desc, assigned_to, dept, "Pending", priority, frequency, 
-                                      due_date.strftime("%Y-%m-%d"), due_time.strftime("%H:%M"), 
-                                      admin_files_json[:1] if admin_files_json != "[]" else "", 
-                                      admin_files_json, 
-                                      datetime.now().strftime("%Y-%m-%d %H:%M")))
-                        conn.commit()
-                        conn.close()
+
+                        insert_task_record(
+                            desc,
+                            assigned_to,
+                            dept,
+                            priority,
+                            frequency,
+                            due_date.strftime("%Y-%m-%d"),
+                            due_time.strftime("%H:%M"),
+                            admin_files_json
+                        )
                         st.success("✅ Task Assigned Successfully!")
                         st.info(f"📎 {len(json.loads(admin_files_json))} file(s) attached")
                         st.balloons()
@@ -425,8 +811,8 @@ if st.session_state.role == "Admin":
 
     with tab2:
         st.subheader("👥 Team Member Directory")
-        employees = pd.read_sql("SELECT username, full_name, dept, designation, phone FROM users WHERE role='Employee'", get_db())
-        
+        employees = get_employee_rows()
+
         if employees.empty:
             st.info("No employees added yet.")
         else:
@@ -448,14 +834,11 @@ if st.session_state.role == "Admin":
             
             st.divider()
             st.subheader(f"Tasks & Proofs for {member['full_name']}")
-            
-            tasks_df = pd.read_sql(""" 
-                SELECT id, description, status, priority, frequency, due_date, 
-                       emp_remark, emp_screenshot, emp_files_json
-                FROM tasks 
-                WHERE assigned_to = ?
-            """, get_db(), params=(member['username'],))
-            
+
+            tasks_df = get_tasks_for_user(member['username'])
+            if not tasks_df.empty:
+                tasks_df = tasks_df[["id", "description", "status", "priority", "frequency", "due_date", "emp_remark", "emp_screenshot", "emp_files_json"]].copy()
+
             if tasks_df.empty:
                 st.info("No tasks assigned yet.")
             else:
@@ -486,28 +869,11 @@ if st.session_state.role == "Admin":
                         try:
                             emp_files_json = row.get('emp_files_json', '[]')
                             emp_files = json.loads(emp_files_json) if emp_files_json else []
-                            
+
                             if emp_files:
                                 st.subheader("📎 Uploaded Files")
                                 for file_path in emp_files:
-                                    file_name = os.path.basename(file_path)
-                                    if file_path.startswith("http"):
-                                        st.markdown(f"[📄 {file_name}]({file_path})")
-                                    elif os.path.exists(file_path):
-                                        col1, col2 = st.columns([3, 1])
-                                        with col1:
-                                            st.write(f"📄 {file_name}")
-                                        with col2:
-                                            try:
-                                                with open(file_path, "rb") as f:
-                                                    st.download_button(
-                                                        label="⬇️ Download",
-                                                        data=f.read(),
-                                                        file_name=file_name,
-                                                        key=f"download_{row['id']}_{os.path.basename(file_path)}"
-                                                    )
-                                            except:
-                                                st.write("Unable to download")
+                                    render_attachment(file_path, f"download_{row['id']}", allow_link=True)
                             else:
                                 st.info("No files uploaded yet.")
                         except Exception as e:
@@ -517,58 +883,57 @@ if st.session_state.role == "Admin":
 
     with tab3:
         st.subheader("Edit / Delete Task")
-        all_tasks = pd.read_sql("SELECT id, description FROM tasks ORDER BY id DESC", get_db())
-        
+        all_tasks = get_tasks_df()
+        if not all_tasks.empty:
+            all_tasks = all_tasks[["id", "description"]].copy()
+            all_tasks = all_tasks.sort_values("id", ascending=False)
+
         if all_tasks.empty:
             st.info("No tasks available.")
         else:
             task_options = [f"ID {row['id']}: {row['description'][:50]}..." for _, row in all_tasks.iterrows()]
             selected_task_option = st.selectbox("Select Task", task_options)
             task_id = int(selected_task_option.split(":")[0].replace("ID ", ""))
-            
-            task_data = pd.read_sql("SELECT * FROM tasks WHERE id=?", get_db(), params=(task_id,)).iloc[0]
-            
-            with st.form("edit_form"):
-                new_desc = st.text_area("Task Description", value=task_data['description'], height=100)
-                new_status = st.selectbox("Status", ["Pending", "In Progress", "Need Help", "Work Completed"], 
-                                        index=["Pending","In Progress","Need Help","Work Completed"].index(task_data['status']))
-                new_priority = st.selectbox("Priority", ["High", "Medium", "Low"], 
-                                          index=["High","Medium","Low"].index(task_data['priority']))
-                new_due = st.date_input("Due Date", value=datetime.strptime(task_data['due_date'], "%Y-%m-%d").date() if task_data['due_date'] else datetime.now().date())
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.form_submit_button("💾 Update Task"):
-                        conn = get_db()
-                        conn.execute("""UPDATE tasks SET description=?, status=?, priority=?, due_date=? WHERE id=?""",
-                                    (new_desc, new_status, new_priority, new_due.strftime("%Y-%m-%d"), task_id))
-                        conn.commit()
-                        conn.close()
-                        st.success("Task updated successfully!")
-                        st.rerun()
-                
-                with col2:
-                    confirm = st.checkbox("⚠️ I confirm I want to delete this task")
-                    if st.form_submit_button("🗑️ Delete Task", type="secondary", disabled=not confirm):
-                        conn = get_db()
-                        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-                        conn.commit()
-                        conn.close()
-                        st.success("Task deleted successfully!")
-                        st.rerun()
+
+            task_data = get_task_row(task_id)
+            if task_data is None:
+                st.error("Task not found.")
+            else:
+                with st.form("edit_form"):
+                    new_desc = st.text_area("Task Description", value=task_data['description'], height=100)
+                    new_status = st.selectbox("Status", ["Pending", "In Progress", "Need Help", "Work Completed"],
+                                            index=["Pending", "In Progress", "Need Help", "Work Completed"].index(task_data['status']))
+                    new_priority = st.selectbox("Priority", ["High", "Medium", "Low"],
+                                              index=["High", "Medium", "Low"].index(task_data['priority']))
+                    new_due = st.date_input("Due Date", value=datetime.strptime(task_data['due_date'], "%Y-%m-%d").date() if task_data['due_date'] else datetime.now().date())
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        if st.form_submit_button("💾 Update Task"):
+                            update_task_record(task_id, new_desc, new_status, new_priority, new_due.strftime("%Y-%m-%d"))
+                            st.success("Task updated successfully!")
+                            st.rerun()
+
+                    with col2:
+                        confirm = st.checkbox("⚠️ I confirm I want to delete this task")
+                        if st.form_submit_button("🗑️ Delete Task", type="secondary", disabled=not confirm):
+                            delete_task_record(task_id)
+                            st.success("Task deleted successfully!")
+                            st.rerun()
 
     with tab4:
         st.subheader("📊 Overall Dashboard & Task Analytics")
         col1, col2, col3, col4 = st.columns(4)
-        
-        total_tasks = pd.read_sql("SELECT COUNT(*) as count FROM tasks", get_db()).iloc[0]['count']
-        completed = pd.read_sql("SELECT COUNT(*) as count FROM tasks WHERE status='Work Completed'", get_db()).iloc[0]['count']
-        pending = pd.read_sql("SELECT COUNT(*) as count FROM tasks WHERE status != 'Work Completed'", get_db()).iloc[0]['count']
-        overdue = pd.read_sql(""" 
-            SELECT COUNT(*) as count FROM tasks 
-            WHERE due_date < ? AND status != 'Work Completed'
-        """, get_db(), params=(datetime.now().date().strftime("%Y-%m-%d"),)).iloc[0]['count']
-        
+
+        tasks_df = get_tasks_df()
+        if tasks_df.empty:
+            tasks_df = pd.DataFrame(columns=["status", "due_date", "id", "dept"])
+            
+        total_tasks = len(tasks_df)
+        completed = int((tasks_df["status"] == "Work Completed").sum()) if "status" in tasks_df.columns else 0
+        pending = int((tasks_df["status"] != "Work Completed").sum()) if "status" in tasks_df.columns else 0
+        overdue = int(((tasks_df["due_date"] < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df["status"] != "Work Completed")).sum()) if "due_date" in tasks_df.columns and "status" in tasks_df.columns else 0
+
         with col1:
             st.metric("Total Tasks", total_tasks)
         with col2:
@@ -580,23 +945,37 @@ if st.session_state.role == "Admin":
         
         st.divider()
         st.subheader("📋 All Tasks Overview")
-        detailed_df = pd.read_sql(""" 
-            SELECT 
-                t.id,
-                t.description as task_description,
-                u.full_name as employee_name,
-                t.dept as department,
-                t.status,
-                t.priority,
-                t.frequency,
-                t.due_date,
-                t.timestamp as assigned_date,
-                t.emp_remark as employee_remark
-            FROM tasks t
-            LEFT JOIN users u ON t.assigned_to = u.username
-            ORDER BY t.id DESC
-        """, get_db())
+        users_df = get_users_df()
         
+        if not tasks_df.empty and not users_df.empty and "assigned_to" in tasks_df.columns and "username" in users_df.columns:
+            detailed_df = tasks_df.merge(
+                users_df[["username", "full_name"]],
+                left_on="assigned_to",
+                right_on="username",
+                how="left"
+            ).copy()
+            detailed_df = detailed_df.rename(columns={
+                "description": "task_description",
+                "full_name": "employee_name",
+                "dept": "department",
+                "timestamp": "assigned_date",
+                "emp_remark": "employee_remark"
+            })
+            detailed_df = detailed_df[[
+                "id",
+                "task_description",
+                "employee_name",
+                "department",
+                "status",
+                "priority",
+                "frequency",
+                "due_date",
+                "assigned_date",
+                "employee_remark"
+            ]].sort_values("id", ascending=False)
+        else:
+            detailed_df = pd.DataFrame()
+
         if not detailed_df.empty:
             # Display tasks with visual indicators
             for idx, (_, row) in enumerate(detailed_df.iterrows()):
@@ -624,7 +1003,7 @@ if st.session_state.role == "Admin":
                     with col_info2:
                         st.caption(f"🔄 Frequency: {row['frequency']}")
                     with col_info3:
-                        st.caption(f"📌 Assigned: {row['assigned_date'][:10]}")
+                        st.caption(f"📌 Assigned: {row['assigned_date'][:10] if row['assigned_date'] else 'N/A'}")
                     
                     if row['employee_remark']:
                         st.info(f"💬 **Employee Update:** {row['employee_remark']}")
@@ -633,18 +1012,16 @@ if st.session_state.role == "Admin":
         
         st.divider()
         st.subheader("📍 Department-wise Task Summary")
-        dept_summary = pd.read_sql(""" 
-            SELECT 
-                t.dept as department,
-                COUNT(*) as total_tasks,
-                SUM(CASE WHEN t.status = 'Work Completed' THEN 1 ELSE 0 END) as completed,
-                SUM(CASE WHEN t.status != 'Work Completed' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN t.due_date < ? AND t.status != 'Work Completed' THEN 1 ELSE 0 END) as overdue
-            FROM tasks t
-            GROUP BY t.dept
-        """, get_db(), params=(datetime.now().date().strftime("%Y-%m-%d"),))
-        
-        st.dataframe(dept_summary, use_container_width=True, hide_index=True)
+        if not tasks_df.empty and "dept" in tasks_df.columns:
+            dept_summary = tasks_df.groupby("dept").agg(
+                total_tasks=("id", "count"),
+                completed=("status", lambda s: int((s == "Work Completed").sum())),
+                pending=("status", lambda s: int((s != "Work Completed").sum())),
+                overdue=("due_date", lambda s: int(((s < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df.loc[s.index, "status"] != "Work Completed")).sum()))
+            ).reset_index()
+            st.dataframe(dept_summary, use_container_width=True, hide_index=True)
+        else:
+            st.info("No department metrics available.")
 
     with tab5:
         col_add, col_rem = st.columns(2)
@@ -655,22 +1032,15 @@ if st.session_state.role == "Admin":
                 full_name = st.text_input("Full Name *")
                 username = st.text_input("Username (Login ID) *")
                 password = st.text_input("Password *", type="password")
-                dept = st.selectbox("Department", 
+                dept = st.selectbox("Department",
                                   ["Solar Installation", "Technical Support", "Sales & Marketing", "HR & Admin", "Accounts"])
                 designation = st.text_input("Designation")
                 phone = st.text_input("Phone Number")
-                
+
                 if st.form_submit_button("✅ Add Employee", type="primary"):
                     if full_name and username and password and dept:
                         try:
-                            conn = get_db()
-                            # Strip whitespace from inputs to avoid login issues
-                            conn.execute("""INSERT INTO users 
-                                         (username, password, full_name, dept, designation, phone, role) 
-                                         VALUES (?,?,?,?,?,?,?)""",
-                                         (username.strip(), password.strip(), full_name.strip(), dept.strip(), designation.strip(), phone.strip(), "Employee"))
-                            conn.commit()
-                            conn.close()
+                            insert_user_record(full_name.strip(), username.strip(), password.strip(), dept.strip(), designation.strip(), phone.strip())
                             st.success(f"✅ Employee **{full_name}** added!")
                             st.rerun()
                         except Exception as e:
@@ -680,26 +1050,24 @@ if st.session_state.role == "Admin":
 
         with col_rem:
             st.subheader("🗑️ Remove Employee")
-            emp_list_df = pd.read_sql("SELECT username, full_name, dept FROM users WHERE role='Employee'", get_db())
-            
+            emp_list_df = get_employee_rows()
+            if not emp_list_df.empty:
+                emp_list_df = emp_list_df[["username", "full_name", "dept"]].copy()
+
             if emp_list_df.empty:
                 st.info("No employees found in database.")
             else:
-                options = {f"{row['full_name']} ({row['username']}) - {row['dept']}": row['username'] 
+                options = {f"{row['full_name']} ({row['username']}) - {row['dept']}": row['username']
                            for _, row in emp_list_df.iterrows()}
-                
+
                 selected_to_remove = st.selectbox("Select Employee to Remove", options.keys())
                 target_user = options[selected_to_remove]
-                
+
                 confirm = st.checkbox(f"I confirm I want to delete {target_user}")
-                
+
                 if st.button("❌ Permanent Delete", type="secondary", use_container_width=True):
                     if confirm:
-                        conn = get_db()
-                        conn.execute("DELETE FROM users WHERE username=?", (target_user,))
-                        conn.execute("DELETE FROM tasks WHERE assigned_to=?", (target_user,))
-                        conn.commit()
-                        conn.close()
+                        delete_user_record(target_user)
                         st.warning(f"Employee {target_user} and their tasks have been removed.")
                         st.rerun()
                     else:
@@ -787,10 +1155,8 @@ elif st.session_state.role == "Employee":
     tab_tasks, tab_security = st.tabs(["📋 My Tasks", "🔐 Security & Password"])
 
     with tab_tasks:
-        conn = get_db()
-        tasks = pd.read_sql("SELECT * FROM tasks WHERE assigned_to = ?", conn, params=(st.session_state.user,))
-        conn.close()
-        
+        tasks = get_tasks_for_user(st.session_state.user)
+
         if tasks.empty:
             st.info("No tasks assigned to you yet.")
         else:
@@ -798,70 +1164,46 @@ elif st.session_state.role == "Employee":
                 with st.container(border=True):
                     st.subheader(f"Task: {row['description']}")
                     st.warning(f"⏰ **Deadline:** {row['due_date']} at {row.get('due_time', 'Not set')}")
-                    
-                    # Resources Section - Display multiple admin files
+
                     try:
                         admin_files_json = row.get('admin_files_json', '[]')
                         admin_files = json.loads(admin_files_json) if admin_files_json else []
-                        
+
                         if admin_files:
                             st.subheader("📦 Resources from Admin")
                             for file_path in admin_files:
-                                file_name = os.path.basename(file_path)
-                                if file_path.startswith("http"):
-                                    st.markdown(f"[📄 {file_name}]({file_path})")
-                                elif os.path.exists(file_path):
-                                    col1, col2 = st.columns([3, 1])
-                                    with col1:
-                                        st.write(f"📄 {file_name}")
-                                    with col2:
-                                        try:
-                                            with open(file_path, "rb") as f:
-                                                st.download_button(
-                                                    label="⬇️",
-                                                    data=f.read(),
-                                                    file_name=file_name,
-                                                    key=f"admin_dl_{row['id']}_{os.path.basename(file_path)}"
-                                                )
-                                        except:
-                                            st.write("❌")
+                                render_attachment(file_path, f"admin_task_{row['id']}", allow_link=True)
                     except Exception as e:
                         st.warning(f"Error loading resources: {str(e)}")
-                    
+
                     st.divider()
-                    
+
                     col_status, col_upload = st.columns(2)
                     with col_status:
                         new_status = st.selectbox("Update Status", ["Pending", "In Progress", "Work Completed"], key=f"s_{row['id']}")
                         remark = st.text_area("Notes", value=row.get('emp_remark', ''), key=f"r_{row['id']}")
                     with col_upload:
-                        proof_file = st.file_uploader("📎 Upload Proof/Attachments - Multiple Files", 
+                        proof_file = st.file_uploader("📎 Upload Proof/Attachments - Multiple Files",
                                                      type=["pdf", "xlsx", "xls", "mp4", "jpg", "png", "jpeg", "doc", "docx", "txt"],
                                                      key=f"p_{row['id']}", accept_multiple_files=True)
 
                     if st.button("🚀 Submit Update", key=f"b_{row['id']}", type="primary"):
                         try:
-                            # Logic to save multiple files and update DB
                             emp_files_json = row.get('emp_files_json', '[]')
                             if emp_files_json == '[]' or not emp_files_json:
                                 emp_files_json = '[]'
-                            
+
                             current_files = json.loads(emp_files_json) if emp_files_json else []
-                            
+
                             if proof_file:
                                 for uploaded_file in proof_file:
-                                    file_url = save_file_to_supabase(uploaded_file, f"proof_{row['id']}_{uuid.uuid4().hex[:5]}")
-                                    current_files.append(file_url)
-                            
+                                    file_path = save_uploaded_file(uploaded_file, f"proof_{row['id']}_{uuid.uuid4().hex[:5]}")
+                                    current_files.append(file_path)
+
                             final_files_json = json.dumps(current_files)
-                            
-                            conn = get_db()
-                            conn.execute("UPDATE tasks SET status=?, emp_remark=?, emp_screenshot=?, emp_files_json=? WHERE id=?", 
-                                         (new_status, remark, final_files_json[:1] if final_files_json != "[]" else "", 
-                                          final_files_json, row['id']))
-                            conn.commit()
-                            conn.close()
-                            
+                            first_emp_file = current_files[0] if current_files else ""
+                            update_task_progress(row['id'], new_status, remark, first_emp_file, final_files_json)
+
                             st.success("✅ Work updated successfully!")
                             st.info(f"✔️ Status: {new_status} | {len(current_files)} file(s) uploaded | Saved at {datetime.now().strftime('%H:%M:%S')}")
                             st.balloons()
@@ -874,32 +1216,26 @@ elif st.session_state.role == "Employee":
     with tab_security:
         st.subheader("Update Your Password")
         st.info("Keep your account secure by choosing a strong password.")
-        
+
         with st.form("change_password_form"):
             current_pass = st.text_input("Current Password", type="password")
             new_pass = st.text_input("New Password", type="password")
             confirm_pass = st.text_input("Confirm New Password", type="password")
-            
+
             if st.form_submit_button("Update Password"):
-                conn = get_db()
-                # Verify current password
-                user_data = conn.execute("SELECT password FROM users WHERE username=?", 
-                                        (st.session_state.user.strip(),)).fetchone()
-                
+                user_record = get_user_record(st.session_state.user)
+
                 if not current_pass or not new_pass:
                     st.error("Please fill all fields.")
-                elif user_data[0] != current_pass:
+                elif not verify_password(current_pass, user_record.get("password") if user_record else None):
                     st.error("❌ Current password is incorrect.")
                 elif new_pass != confirm_pass:
                     st.error("❌ New passwords do not match.")
                 elif len(new_pass) < 6:
                     st.warning("⚠️ New password should be at least 6 characters long.")
                 else:
-                    conn.execute("UPDATE users SET password=? WHERE username=?", 
-                                 (new_pass, st.session_state.user))
-                    conn.commit()
+                    update_user_password_record(st.session_state.user, new_pass)
                     st.success("✅ Password updated successfully! Please login again next time.")
-                conn.close()
 
     st.divider()
     st.caption("© 2026 SunSys ERP Portal by Aditya kumar | All rights reserved.")
