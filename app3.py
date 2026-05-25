@@ -10,14 +10,6 @@ import base64
 import json
 import secrets
 import hashlib
-import urllib.request
-from urllib.parse import urlparse, urlunparse
-try:
-    from supabase import create_client
-    SUPABASE_AVAILABLE = True
-except ModuleNotFoundError:
-    create_client = None
-    SUPABASE_AVAILABLE = False
 
 # 1. PATH SETUP
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -26,32 +18,6 @@ os.makedirs(DATA_FOLDER, exist_ok=True)
 DB_PATH = os.path.join(DATA_FOLDER, "sunsys_erp.db")
 ATTACHMENT_PATH = os.path.join(DATA_FOLDER, "attachments")
 os.makedirs(ATTACHMENT_PATH, exist_ok=True)
-
-supabase = None
-SUPABASE_ENABLED = False
-SUPABASE_BUCKET_NAME = "attachments"
-
-if SUPABASE_AVAILABLE:
-    try:
-        raw_supabase_url = st.secrets.get("SUPABASE_URL", "").rstrip("/")
-        if not raw_supabase_url:
-            raise ValueError("SUPABASE_URL not set in Streamlit secrets")
-        parsed_url = urlparse(raw_supabase_url)
-        if parsed_url.path and parsed_url.path != "/":
-            raw_supabase_url = urlunparse((parsed_url.scheme, parsed_url.netloc, "", "", "", ""))
-
-        supabase = create_client(
-            raw_supabase_url,
-            st.secrets.get("SUPABASE_KEY", "")
-        )
-        SUPABASE_ENABLED = True
-        SUPABASE_BUCKET_NAME = str(st.secrets.get("SUPABASE_BUCKET", "attachments")).strip() or "attachments"
-    except Exception as e:
-        supabase = None
-        SUPABASE_ENABLED = False
-        st.warning(f"Supabase client initialization failed: {e}")
-else:
-    st.warning("Python package 'supabase' is not installed. Supabase features are disabled. Install with `pip install supabase` or add it to requirements.txt before deploying.")
 
 
 # 2. UPDATED GET_DB
@@ -142,34 +108,11 @@ def verify_password(password, stored_password):
     return stored_password == password
 
 
-def supabase_response_to_df(response):
-    data = getattr(response, "data", None)
-    if isinstance(data, dict) and "data" in data:
-        data = data["data"]
-    if data is None:
-        return pd.DataFrame()
-    if isinstance(data, dict):
-        return pd.DataFrame([data])
-    if isinstance(data, list):
-        return pd.DataFrame(data)
-    return pd.DataFrame([data])
-
-
 def get_users_df():
-    if SUPABASE_ENABLED:
-        try:
-            return supabase_response_to_df(supabase.table("users").select("*").execute())
-        except Exception:
-            return pd.DataFrame(columns=["username", "password", "full_name", "dept", "designation", "phone", "role"])
     return pd.read_sql("SELECT * FROM users", get_db())
 
 
 def get_tasks_df():
-    if SUPABASE_ENABLED:
-        try:
-            return supabase_response_to_df(supabase.table("tasks").select("*").execute())
-        except Exception:
-            return pd.DataFrame(columns=["id", "description", "assigned_to", "dept", "status", "priority", "frequency", "due_date", "due_time", "admin_file", "emp_remark", "emp_screenshot", "timestamp", "admin_files_json", "emp_files_json"])
     return pd.read_sql("SELECT * FROM tasks", get_db())
 
 
@@ -189,64 +132,22 @@ def authenticate_user(username, password):
         return None
     if verify_password(password, user.get("password")):
         return user
+    if user.get("password") == password:
+        return user
     return None
 
 
-def ensure_supabase_seed_admin():
-    if not SUPABASE_ENABLED:
-        return
-    users_df = get_users_df()
-    if not users_df.empty and "username" in users_df.columns and (users_df["username"] == "admin").any():
-        return
-
-    try:
-        supabase.table("users").insert({
-            "username": "admin",
-            "password": hash_password("admin2026"),
-            "full_name": "HR Manager",
-            "dept": "HR & Admin",
-            "designation": "HR Head",
-            "phone": "",
-            "role": "Admin"
-        }).execute()
-    except Exception:
-        pass
-
-
-def ensure_supabase_tables():
-    if not SUPABASE_ENABLED:
-        return
-    ensure_supabase_seed_admin()
-
-
 def insert_user_record(full_name, username, password, dept, designation, phone):
-    if SUPABASE_ENABLED:
-        supabase.table("users").insert({
-            "username": username,
-            "password": hash_password(password),
-            "full_name": full_name,
-            "dept": dept,
-            "designation": designation,
-            "phone": phone,
-            "role": "Employee"
-        }).execute()
-        return
-
     conn = get_db()
     conn.execute("""INSERT INTO users
                      (username, password, full_name, dept, designation, phone, role)
                      VALUES (?,?,?,?,?,?,?)""",
-                 (username, password, full_name, dept, designation, phone, "Employee"))
+                 (username, hash_password(password), full_name, dept, designation, phone, "Employee"))
     conn.commit()
     conn.close()
 
 
 def delete_user_record(username):
-    if SUPABASE_ENABLED:
-        supabase.table("users").delete().eq("username", username).execute()
-        supabase.table("tasks").delete().eq("assigned_to", username).execute()
-        return
-
     conn = get_db()
     conn.execute("DELETE FROM users WHERE username=?", (username,))
     conn.execute("DELETE FROM tasks WHERE assigned_to=?", (username,))
@@ -255,12 +156,8 @@ def delete_user_record(username):
 
 
 def update_user_password_record(username, new_password):
-    if SUPABASE_ENABLED:
-        supabase.table("users").update({"password": hash_password(new_password)}).eq("username", username).execute()
-        return
-
     conn = get_db()
-    conn.execute("UPDATE users SET password=? WHERE username=?", (new_password, username))
+    conn.execute("UPDATE users SET password=? WHERE username=?", (hash_password(new_password), username))
     conn.commit()
     conn.close()
 
@@ -268,25 +165,6 @@ def update_user_password_record(username, new_password):
 def insert_task_record(description, assigned_to, dept, priority, frequency, due_date, due_time, admin_files_json):
     first_admin_file = json.loads(admin_files_json)[0] if admin_files_json and json.loads(admin_files_json) else ""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    if SUPABASE_ENABLED:
-        supabase.table("tasks").insert({
-            "description": description,
-            "assigned_to": assigned_to,
-            "dept": dept,
-            "status": "Pending",
-            "priority": priority,
-            "frequency": frequency,
-            "due_date": due_date,
-            "due_time": due_time,
-            "admin_file": first_admin_file,
-            "admin_files_json": admin_files_json,
-            "emp_remark": "",
-            "emp_screenshot": "",
-            "timestamp": timestamp,
-            "emp_files_json": "[]"
-        }).execute()
-        return
 
     conn = get_db()
     conn.execute("""INSERT INTO tasks
@@ -298,15 +176,6 @@ def insert_task_record(description, assigned_to, dept, priority, frequency, due_
 
 
 def update_task_record(task_id, description, status, priority, due_date):
-    if SUPABASE_ENABLED:
-        supabase.table("tasks").update({
-            "description": description,
-            "status": status,
-            "priority": priority,
-            "due_date": due_date
-        }).eq("id", task_id).execute()
-        return
-
     conn = get_db()
     conn.execute("""UPDATE tasks SET description=?, status=?, priority=?, due_date=? WHERE id=?""",
                  (description, status, priority, due_date, task_id))
@@ -315,10 +184,6 @@ def update_task_record(task_id, description, status, priority, due_date):
 
 
 def delete_task_record(task_id):
-    if SUPABASE_ENABLED:
-        supabase.table("tasks").delete().eq("id", task_id).execute()
-        return
-
     conn = get_db()
     conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     conn.commit()
@@ -326,15 +191,6 @@ def delete_task_record(task_id):
 
 
 def update_task_progress(task_id, status, remark, first_emp_file, emp_files_json):
-    if SUPABASE_ENABLED:
-        supabase.table("tasks").update({
-            "status": status,
-            "emp_remark": remark,
-            "emp_screenshot": first_emp_file,
-            "emp_files_json": emp_files_json
-        }).eq("id", task_id).execute()
-        return
-
     conn = get_db()
     conn.execute("UPDATE tasks SET status=?, emp_remark=?, emp_screenshot=?, emp_files_json=? WHERE id=?",
                  (status, remark, first_emp_file, emp_files_json, task_id))
@@ -366,89 +222,13 @@ def get_tasks_for_user(username):
     return tasks_df[tasks_df["assigned_to"] == username].copy()
 
 
-def is_storage_ref(value):
-    return isinstance(value, str) and value.startswith("storage://")
-
-
-def parse_storage_ref(value):
-    if not is_storage_ref(value):
-        return None, None
-    raw = value[len("storage://"):]
-    bucket, path = raw.split("/", 1)
-    return bucket, path
-
-
-def make_storage_ref(bucket_name, path):
-    return f"storage://{bucket_name}/{path}"
-
-
-def ensure_supabase_bucket():
-    if not SUPABASE_ENABLED:
-        raise RuntimeError("Supabase is not enabled")
-
-    bucket_name = SUPABASE_BUCKET_NAME
-    try:
-        supabase.storage.get_bucket(bucket_name)
-        return bucket_name
-    except Exception:
-        create_response = supabase.storage.create_bucket(bucket_name, {"public": False})
-        if isinstance(create_response, dict) and create_response.get("error"):
-            raise RuntimeError(create_response["error"])
-        return bucket_name
-
-
-def get_supabase_signed_url(file_ref):
-    if not is_storage_ref(file_ref):
-        return file_ref
-    bucket_name, path = parse_storage_ref(file_ref)
-    response = supabase.storage.from_(bucket_name).create_signed_url(path, 3600)
-    if isinstance(response, dict):
-        if response.get("error"):
-            raise RuntimeError(response["error"])
-        return response.get("signedURL") or response.get("data", {}).get("signedURL")
-    if hasattr(response, "data") and response.data:
-        return response.data.get("signedURL")
-    return None
-
-
-def download_storage_bytes(file_ref):
-    signed_url = get_supabase_signed_url(file_ref)
-    with urllib.request.urlopen(signed_url) as response:
-        return response.read()
-
-
 def get_attachment_name(file_ref):
-    if is_storage_ref(file_ref):
-        _, path = parse_storage_ref(file_ref)
-        return os.path.basename(path)
     if isinstance(file_ref, str):
         return os.path.basename(file_ref)
     return "attachment"
 
 
 def render_attachment(file_ref, key_prefix, allow_link=False):
-    if is_storage_ref(file_ref):
-        name = get_attachment_name(file_ref)
-        signed_url = get_supabase_signed_url(file_ref)
-        if allow_link and signed_url:
-            st.markdown(f"[📄 {name}]({signed_url})")
-        else:
-            st.write(f"📄 {name}")
-        try:
-            st.download_button(
-                label="⬇️ Download",
-                data=download_storage_bytes(file_ref),
-                file_name=name,
-                key=f"{key_prefix}_{name}"
-            )
-        except Exception:
-            st.write("Unable to download")
-        return
-
-    if isinstance(file_ref, str) and file_ref.startswith("http"):
-        st.markdown(f"[📄 {get_attachment_name(file_ref)}]({file_ref})")
-        return
-
     if isinstance(file_ref, str) and os.path.exists(file_ref):
         name = get_attachment_name(file_ref)
         col1, col2 = st.columns([3, 1])
@@ -471,26 +251,6 @@ def render_attachment(file_ref, key_prefix, allow_link=False):
         st.write(f"📄 {get_attachment_name(file_ref)}")
 
 
-def save_file_to_supabase(uploaded_file, prefix):
-    if not SUPABASE_ENABLED:
-        raise RuntimeError("Supabase is not enabled. Configure SUPABASE_URL and SUPABASE_KEY.")
-
-    bucket_name = ensure_supabase_bucket()
-    file_name = Path(uploaded_file.name).name
-    file_ext = Path(file_name).suffix
-    unique_name = f"{prefix}_{secrets.token_hex(10)}{file_ext}"
-    file_bytes = uploaded_file.getvalue()
-    upload_response = supabase.storage.from_(bucket_name).upload(
-        unique_name,
-        file_bytes,
-        {"content-type": getattr(uploaded_file, "type", "application/octet-stream")}
-    )
-    if isinstance(upload_response, dict) and upload_response.get("error"):
-        raise RuntimeError(upload_response["error"])
-
-    return make_storage_ref(bucket_name, unique_name)
-
-
 def save_file_to_local(uploaded_file, prefix):
     file_name = Path(uploaded_file.name).name
     file_ext = Path(file_name).suffix
@@ -502,20 +262,13 @@ def save_file_to_local(uploaded_file, prefix):
 
 
 def save_uploaded_file(uploaded_file, prefix):
-    if SUPABASE_ENABLED:
-        try:
-            return save_file_to_supabase(uploaded_file, prefix)
-        except Exception as e:
-            raise RuntimeError(f"Supabase upload failed: {e}")
     return save_file_to_local(uploaded_file, prefix)
 
 
 # 4. CRITICAL: TRIGGER INITIALIZATION
-if SUPABASE_ENABLED:
-    ensure_supabase_tables()
-else:
-    init_db()
-    migrate_db()
+init_db()
+migrate_db()
+
 
 # ====================== HELPER FUNCTION TO DISPLAY PDF (New Feature) ======================
 def display_pdf(pdf_path):
@@ -532,12 +285,9 @@ def display_pdf(pdf_path):
     else:
         st.info("No PDF attached for this task.")
 
+
 # ====================== ATTRACTIVE UI/UX STYLING ======================
 st.set_page_config(page_title="SunSys ERP", page_icon="☀️", layout="wide")
-
-if not SUPABASE_ENABLED:
-    st.error("Secure mode requires Supabase. Add SUPABASE_URL, SUPABASE_KEY, and install the `supabase` package to continue.")
-    st.stop()
 
 st.markdown("""
     <style>
@@ -574,6 +324,7 @@ st.markdown("""
     .stDataFrame { font-size: 18px !important; }
     </style>
 """, unsafe_allow_html=True)
+
 
 # ====================== HEADER WITH LIVE TIME & DATE ======================
 import streamlit.components.v1 as components
@@ -618,6 +369,7 @@ with col3:
         """,
         height=110,
     )
+
 
 # ====================== AUTHENTICATION ======================
 if "auth" not in st.session_state:
@@ -670,10 +422,11 @@ if st.sidebar.button("🚪 Logout"):
     st.session_state.auth = False
     st.rerun()
 
+
 # ====================== HELPER FUNCTION: GET RECENTLY UPDATED TASKS ======================
 def get_recent_task_updates(hours=24):
     """Fetch tasks updated in the last N hours with employee details"""
-    cutoff_time = (datetime.now() - timedelta(hours=hours)).replace(tzinfo=None)
+    cutoff_time = datetime.now() - timedelta(hours=hours)
     tasks_df = get_tasks_df()
     users_df = get_users_df()
 
@@ -694,7 +447,7 @@ def get_recent_task_updates(hours=24):
         recent_tasks["status"].isin(["In Progress", "Need Help", "Work Completed"])
     ].copy()
 
-    recent_tasks["assigned_date"] = pd.to_datetime(recent_tasks["timestamp"], errors="coerce").dt.tz_localize(None)
+    recent_tasks["assigned_date"] = pd.to_datetime(recent_tasks["timestamp"], errors="coerce")
     recent_tasks = recent_tasks[recent_tasks["assigned_date"] >= cutoff_time].copy()
     recent_tasks["updated_time"] = recent_tasks["assigned_date"]
     recent_tasks = recent_tasks.sort_values("id", ascending=False).head(20)
@@ -723,6 +476,7 @@ def get_status_badge_color(status):
     else:
         return "⚪ Pending"
 
+
 # ====================== ADMIN PANEL ======================
 if st.session_state.role == "Admin":
     st.header("📊 HR Command Center")
@@ -731,12 +485,10 @@ if st.session_state.role == "Admin":
     
     with tab1:
         st.subheader("Assign New Task")
-        # Department selector outside form for dynamic updates
         dept_col, _ = st.columns([1, 3])
         with dept_col:
             selected_dept = st.selectbox("📍 Select Department", ["Solar Installation", "Technical Support", "Sales & Marketing", "HR & Admin", "Accounts"], key="admin_dept_select")
         
-        # Fetch employees based on selected department
         emps_df = get_users_df()
         if not emps_df.empty and "role" in emps_df.columns and "dept" in emps_df.columns:
             emps_df = emps_df[(emps_df["role"] == "Employee") & (emps_df["dept"] == selected_dept)].copy()
@@ -754,8 +506,6 @@ if st.session_state.role == "Admin":
         with st.form("assign_task", clear_on_submit=True):
             desc = st.text_area("Task Description", height=140)
             c1, c2, c3, c4 = st.columns(4)
-            
-            # Department (hidden, using selected_dept from outside)
             dept = selected_dept
             
             if emps_df.empty or not employee_list:
@@ -768,7 +518,6 @@ if st.session_state.role == "Admin":
             priority = c3.selectbox("Priority", ["High", "Medium", "Low"])
             frequency = c4.selectbox("Frequency", ["Daily", "Weekly", "Fortnightly", "One-Time"])
             
-            # --- NEW TIME & FILE OPTIONS ---
             col_date, col_time = st.columns(2)
             due_date = col_date.date_input("Due Date", datetime.now().date() + timedelta(days=7))
             due_time = col_time.time_input("Due Time (Deadline)", value=datetime.now().time())
@@ -844,7 +593,6 @@ if st.session_state.role == "Admin":
             else:
                 for _, row in tasks_df.iterrows():
                     with st.container(border=True):
-                        # Status indicator with badge
                         col_title, col_badge = st.columns([3, 1])
                         with col_title:
                             st.write(f"**Task:** {row['description']}")
@@ -865,7 +613,6 @@ if st.session_state.role == "Admin":
                         if row.get('emp_remark'):
                             st.success(f"💬 **Employee Note:** _{row['emp_remark']}_")
                         
-                        # Display multiple uploaded files
                         try:
                             emp_files_json = row.get('emp_files_json', '[]')
                             emp_files = json.loads(emp_files_json) if emp_files_json else []
@@ -977,7 +724,6 @@ if st.session_state.role == "Admin":
             detailed_df = pd.DataFrame()
 
         if not detailed_df.empty:
-            # Display tasks with visual indicators
             for idx, (_, row) in enumerate(detailed_df.iterrows()):
                 with st.container(border=True):
                     col1, col2, col3 = st.columns([2, 1, 1])
@@ -1077,7 +823,6 @@ if st.session_state.role == "Admin":
         st.subheader("🔔 Live Task Update Notifications")
         st.info("📬 Real-time updates when employees submit task progress")
         
-        # Refresh button
         col_refresh, col_filter = st.columns([1, 3])
         with col_refresh:
             if st.button("🔄 Refresh Now", use_container_width=True, type="primary"):
@@ -1088,13 +833,11 @@ if st.session_state.role == "Admin":
         
         st.divider()
         
-        # Get recent updates
         recent_updates = get_recent_task_updates(show_hours)
         
         if recent_updates.empty:
             st.info("✨ No task updates in the selected time period.")
         else:
-            # Summary cards
             col1, col2, col3, col4 = st.columns(4)
             
             completed_count = len(recent_updates[recent_updates['status'] == 'Work Completed'])
@@ -1113,7 +856,6 @@ if st.session_state.role == "Admin":
             st.divider()
             st.subheader("📋 Recent Activity")
             
-            # Display updates with visual indicators
             for idx, (_, row) in enumerate(recent_updates.iterrows()):
                 with st.container(border=True):
                     col_status, col_priority = st.columns([2, 1])
@@ -1134,7 +876,6 @@ if st.session_state.role == "Admin":
                     if row['emp_remark']:
                         st.markdown(f"**Employee Note:** _{row['emp_remark']}_")
                     
-                    # Action buttons
                     col_view, col_contact = st.columns(2)
                     with col_view:
                         if st.button(f"👁️ View Full Details", key=f"view_{row['id']}", use_container_width=True):
@@ -1151,7 +892,6 @@ if st.session_state.role == "Admin":
 elif st.session_state.role == "Employee":
     st.header(f"🚀 {st.session_state.dept} Center • Welcome, {st.session_state.user}")
     
-    # Create tabs for Tasks and Security
     tab_tasks, tab_security = st.tabs(["📋 My Tasks", "🔐 Security & Password"])
 
     with tab_tasks:
