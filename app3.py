@@ -463,17 +463,30 @@ def save_uploaded_file(uploaded_file, prefix):
     return save_file_to_local(uploaded_file, prefix)
 
 
-# 4. CRITICAL: TRIGGER INITIALIZATION
+# 4. CRITICAL: TRIGGER INITIALIZATION with resilience
 if SUPABASE_ENABLED:
-    try:
-        ensure_supabase_tables()
-    except Exception as e:
-        st.warning(f"Supabase unavailable during init ({e}); falling back to local SQLite.")
-        SUPABASE_ENABLED = False
+    # Try to connect to Supabase with 3 retries before falling back to SQLite
+    max_retries = 3
+    retry_delay = 1
+    connected = False
+    
+    for attempt in range(max_retries):
         try:
-            supabase = None
-        except Exception:
-            pass
+            ensure_supabase_tables()
+            connected = True
+            st.success("✅ Connected to Supabase")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                retry_delay *= 2  # exponential backoff
+                import time
+                time.sleep(retry_delay)
+            else:
+                st.warning(f"⚠️ Supabase unavailable after {max_retries} attempts; falling back to SQLite. Data is safe.")
+                SUPABASE_ENABLED = False
+                supabase = None
+    
+    if not connected:
         init_db()
         migrate_db()
 else:
