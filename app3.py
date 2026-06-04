@@ -12,8 +12,66 @@ import secrets
 import hashlib
 import urllib.request
 from urllib.parse import urlparse, urlunparse
+
+# Supabase initialization
+try:
+    from supabase import create_client
+    HAS_SUPABASE_PKG = True
+except Exception:
+    create_client = None
+    HAS_SUPABASE_PKG = False
+
+supabase = None
+SUPABASE_ENABLED = False
+SUPABASE_BUCKET_NAME = "attachments"
+
+if HAS_SUPABASE_PKG:
+    try:
+        raw_supabase_url = (
+            st.secrets.get("SUPABASE_URL", "") or
+            os.getenv("SUPABASE_URL", "")
+        ).rstrip("/")
+        if raw_supabase_url:
+            parsed = urlparse(raw_supabase_url)
+            if parsed.path and parsed.path != "/":
+                raw_supabase_url = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+            key = (
+                st.secrets.get("SUPABASE_KEY", "") or
+                os.getenv("SUPABASE_KEY", "")
+            )
+            if raw_supabase_url and key:
+                supabase = create_client(raw_supabase_url, key)
+                SUPABASE_ENABLED = True
+                SUPABASE_BUCKET_NAME = str(
+                    st.secrets.get("SUPABASE_BUCKET", "") or
+                    os.getenv("SUPABASE_BUCKET", "attachments")
+                ).strip() or "attachments"
+            else:
+                SUPABASE_ENABLED = False
+    except Exception as e:
+        st.warning(f"Supabase client initialization failed: {e}")
+
+
+def ensure_supabase_tables():
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        res = supabase.table("users").select("username").eq("username", "admin").execute()
+        if not getattr(res, "data", None):
+            supabase.table("users").insert({
+                "username": "admin",
+                "password": "",
+                "full_name": "HR Manager",
+                "dept": "HR & Admin",
+                "designation": "HR Head",
+                "phone": "",
+                "role": "Admin"
+            }).execute()
+    except Exception:
+        pass
+
 # 1. PATH SETUP
-from supabase_client import supabase, SUPABASE_ENABLED, SUPABASE_BUCKET_NAME, ensure_supabase_tables
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FOLDER = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_FOLDER, exist_ok=True)
@@ -21,7 +79,7 @@ DB_PATH = os.path.join(DATA_FOLDER, "sunsys_erp.db")
 ATTACHMENT_PATH = os.path.join(DATA_FOLDER, "attachments")
 os.makedirs(ATTACHMENT_PATH, exist_ok=True)
 
-# supabase client is provided by `supabase_client.py` import above
+# Supabase client is now initialized inline
 
 
 # 2. UPDATED GET_DB
