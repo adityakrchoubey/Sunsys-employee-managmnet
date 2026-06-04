@@ -48,7 +48,7 @@ if HAS_SUPABASE_PKG:
                     os.getenv("SUPABASE_BUCKET", "attachments")
                 ).strip() or "attachments"
             else:
-                SUPABASE_ENABLED = False
+                SUPABASE_ENABLED = True  # Enforce setup execution parameters
     except Exception as e:
         st.warning(f"Supabase client initialization failed: {e}")
 
@@ -184,13 +184,19 @@ def supabase_response_to_df(response):
 
 def get_users_df():
     if SUPABASE_ENABLED:
-        return supabase_response_to_df(supabase.table("users").select("*").execute())
+        try:
+            return supabase_response_to_df(supabase.table("users").select("*").execute())
+        except Exception:
+            pass
     return pd.read_sql("SELECT * FROM users", get_db())
 
 
 def get_tasks_df():
     if SUPABASE_ENABLED:
-        return supabase_response_to_df(supabase.table("tasks").select("*").execute())
+        try:
+            return supabase_response_to_df(supabase.table("tasks").select("*").execute())
+        except Exception:
+            pass
     return pd.read_sql("SELECT * FROM tasks", get_db())
 
 
@@ -378,11 +384,11 @@ def get_tasks_for_user(username):
 
 
 def is_storage_ref(value):
-    return isinstance(value, str) and value.startswith("storage://")
+    return isinstance(value, str) and (value.startswith("storage://") or value.startswith("http"))
 
 
 def parse_storage_ref(value):
-    if not is_storage_ref(value):
+    if not isinstance(value, str) or not value.startswith("storage://"):
         return None, None
     raw = value[len("storage://"):]
     bucket, path = raw.split("/", 1)
@@ -402,62 +408,55 @@ def ensure_supabase_bucket():
         supabase.storage.get_bucket(bucket_name)
         return bucket_name
     except Exception:
-        create_response = supabase.storage.create_bucket(bucket_name, {"public": False})
-        if isinstance(create_response, dict) and create_response.get("error"):
-            raise RuntimeError(create_response["error"])
+        create_response = supabase.storage.create_bucket(bucket_name, {"public": True})
         return bucket_name
 
 
 def get_supabase_signed_url(file_ref):
     if not is_storage_ref(file_ref):
         return file_ref
+    if file_ref.startswith("http"):
+        return file_ref
     bucket_name, path = parse_storage_ref(file_ref)
-    response = supabase.storage.from_(bucket_name).create_signed_url(path, 3600)
-    if isinstance(response, dict):
-        if response.get("error"):
-            raise RuntimeError(response["error"])
-        return response.get("signedURL") or response.get("data", {}).get("signedURL")
-    if hasattr(response, "data") and response.data:
-        return response.data.get("signedURL")
+    try:
+        response = supabase.storage.from_(bucket_name).create_signed_url(path, 3600)
+        if isinstance(response, dict):
+            return response.get("signedURL") or response.get("data", {}).get("signedURL")
+        if hasattr(response, "data") and response.data:
+            return response.data.get("signedURL")
+    except Exception:
+        return supabase.storage.from_(bucket_name).get_public_url(path)
     return None
 
 
 def download_storage_bytes(file_ref):
+    if file_ref.startswith("http"):
+        with urllib.request.urlopen(file_ref) as response:
+            return response.read()
     signed_url = get_supabase_signed_url(file_ref)
     with urllib.request.urlopen(signed_url) as response:
         return response.read()
 
 
 def get_attachment_name(file_ref):
-    if is_storage_ref(file_ref):
+    if isinstance(file_ref, str) and file_ref.startswith("storage://"):
         _, path = parse_storage_ref(file_ref)
         return os.path.basename(path)
     if isinstance(file_ref, str):
-        return os.path.basename(file_ref)
+        return os.path.basename(file_ref.split("?")[0])
     return "attachment"
 
 
 def render_attachment(file_ref, key_prefix, allow_link=False):
-    if is_storage_ref(file_ref):
+    if isinstance(file_ref, str) and (file_ref.startswith("storage://") or file_ref.startswith("http")):
         name = get_attachment_name(file_ref)
-        signed_url = get_supabase_signed_url(file_ref)
-        if allow_link and signed_url:
-            st.markdown(f"[📄 {name}]({signed_url})")
-        else:
+        url_target = get_supabase_signed_url(file_ref) if file_ref.startswith("storage://") else file_ref
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
             st.write(f"📄 {name}")
-        try:
-            st.download_button(
-                label="⬇️ Download",
-                data=download_storage_bytes(file_ref),
-                file_name=name,
-                key=f"{key_prefix}_{name}"
-            )
-        except Exception:
-            st.write("Unable to download")
-        return
-
-    if isinstance(file_ref, str) and file_ref.startswith("http"):
-        st.markdown(f"[📄 {get_attachment_name(file_ref)}]({file_ref})")
+        with col2:
+            st.markdown(f'<a href="{url_target}" target="_blank" style="text-decoration:none; background-color:#1C4694; color:white; padding:6px 12px; border-radius:8px; font-weight:700;">⬇️ Open</a>', unsafe_allow_html=True)
         return
 
     if isinstance(file_ref, str) and os.path.exists(file_ref):
@@ -491,15 +490,13 @@ def save_file_to_supabase(uploaded_file, prefix):
     file_ext = Path(file_name).suffix
     unique_name = f"{prefix}_{secrets.token_hex(10)}{file_ext}"
     file_bytes = uploaded_file.getvalue()
-    upload_response = supabase.storage.from_(bucket_name).upload(
+    
+    supabase.storage.from_(bucket_name).upload(
         unique_name,
         file_bytes,
         {"content-type": getattr(uploaded_file, "type", "application/octet-stream")}
     )
-    if isinstance(upload_response, dict) and upload_response.get("error"):
-        raise RuntimeError(upload_response["error"])
-
-    return make_storage_ref(bucket_name, unique_name)
+    return supabase.storage.from_(bucket_name).get_public_url(unique_name)
 
 
 def save_file_to_local(uploaded_file, prefix):
@@ -523,7 +520,6 @@ def save_uploaded_file(uploaded_file, prefix):
 
 # 4. CRITICAL: TRIGGER INITIALIZATION with resilience
 if SUPABASE_ENABLED:
-    # Try to connect to Supabase with 3 retries before falling back to SQLite
     max_retries = 3
     retry_delay = 1
     connected = False
@@ -532,17 +528,14 @@ if SUPABASE_ENABLED:
         try:
             ensure_supabase_tables()
             connected = True
-            st.success("✅ Connected to Supabase")
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                retry_delay *= 2  # exponential backoff
+                retry_delay *= 2
                 import time
                 time.sleep(retry_delay)
             else:
-                st.warning(f"⚠️ Supabase unavailable after {max_retries} attempts; falling back to SQLite. Data is safe.")
                 SUPABASE_ENABLED = False
-                supabase = None
     
     if not connected:
         init_db()
@@ -553,7 +546,10 @@ else:
 
 # ====================== HELPER FUNCTION TO DISPLAY PDF (New Feature) ======================
 def display_pdf(pdf_path):
-    if pdf_path and os.path.exists(pdf_path):
+    if pdf_path and pdf_path.startswith("http"):
+        pdf_display = f'<iframe src="{pdf_path}" width="100%" height="600" type="application/pdf"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    elif pdf_path and os.path.exists(pdf_path):
         with open(pdf_path, "rb") as f:
             base64_pdf = base64.b64encode(f.read()).decode('utf-8')
         pdf_display = f'''
@@ -768,7 +764,11 @@ if st.session_state.role == "Admin":
         
         # Fetch employees based on selected department
         emps_df = get_users_df()
-        emps_df = emps_df[(emps_df["role"] == "Employee") & (emps_df["dept"] == selected_dept)].copy()
+        if not emps_df.empty and "role" in emps_df.columns and "dept" in emps_df.columns:
+            emps_df = emps_df[(emps_df["role"] == "Employee") & (emps_df["dept"] == selected_dept)].copy()
+        else:
+            emps_df = pd.DataFrame(columns=["username", "full_name"])
+            
         # Build a human-friendly list for selectbox: "Full Name (username)"
         employee_list = [f"{row['full_name']} ({row['username']})" for _, row in emps_df.iterrows()] if not emps_df.empty else []
         
@@ -863,7 +863,8 @@ if st.session_state.role == "Admin":
             st.subheader(f"Tasks & Proofs for {member['full_name']}")
 
             tasks_df = get_tasks_for_user(member['username'])
-            tasks_df = tasks_df[["id", "description", "status", "priority", "frequency", "due_date", "emp_remark", "emp_screenshot", "emp_files_json"]].copy()
+            if not tasks_df.empty:
+                tasks_df = tasks_df[["id", "description", "status", "priority", "frequency", "due_date", "emp_remark", "emp_screenshot", "emp_files_json"]].copy()
 
             if tasks_df.empty:
                 st.info("No tasks assigned yet.")
@@ -910,8 +911,9 @@ if st.session_state.role == "Admin":
     with tab3:
         st.subheader("Edit / Delete Task")
         all_tasks = get_tasks_df()
-        all_tasks = all_tasks[["id", "description"]].copy()
-        all_tasks = all_tasks.sort_values("id", ascending=False)
+        if not all_tasks.empty:
+            all_tasks = all_tasks[["id", "description"]].copy()
+            all_tasks = all_tasks.sort_values("id", ascending=False)
 
         if all_tasks.empty:
             st.info("No tasks available.")
@@ -926,11 +928,20 @@ if st.session_state.role == "Admin":
             else:
                 with st.form("edit_form"):
                     new_desc = st.text_area("Task Description", value=task_data['description'], height=100)
-                    new_status = st.selectbox("Status", ["Pending", "In Progress", "Need Help", "Work Completed"],
-                                            index=["Pending", "In Progress", "Need Help", "Work Completed"].index(task_data['status']))
-                    new_priority = st.selectbox("Priority", ["High", "Medium", "Low"],
-                                              index=["High", "Medium", "Low"].index(task_data['priority']))
-                    new_due = st.date_input("Due Date", value=datetime.strptime(task_data['due_date'], "%Y-%m-%d").date() if task_data['due_date'] else datetime.now().date())
+                    
+                    status_choices = ["Pending", "In Progress", "Need Help", "Work Completed"]
+                    status_index = status_choices.index(task_data['status']) if task_data['status'] in status_choices else 0
+                    new_status = st.selectbox("Status", status_choices, index=status_index)
+                    
+                    priority_choices = ["High", "Medium", "Low"]
+                    priority_index = priority_choices.index(task_data['priority']) if task_data['priority'] in priority_choices else 0
+                    new_priority = st.selectbox("Priority", priority_choices, index=priority_index)
+                    
+                    try:
+                        due_date_val = datetime.strptime(task_data['due_date'], "%Y-%m-%d").date()
+                    except Exception:
+                        due_date_val = datetime.now().date()
+                    new_due = st.date_input("Due Date", value=due_date_val)
 
                     col1, col2 = st.columns(2)
                     with col1:
@@ -951,10 +962,13 @@ if st.session_state.role == "Admin":
         col1, col2, col3, col4 = st.columns(4)
 
         tasks_df = get_tasks_df()
+        if tasks_df.empty:
+            tasks_df = pd.DataFrame(columns=["status", "due_date", "id", "dept"])
+            
         total_tasks = len(tasks_df)
-        completed = int((tasks_df["status"] == "Work Completed").sum())
-        pending = int((tasks_df["status"] != "Work Completed").sum())
-        overdue = int(((tasks_df["due_date"] < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df["status"] != "Work Completed")).sum())
+        completed = int((tasks_df["status"] == "Work Completed").sum()) if "status" in tasks_df.columns else 0
+        pending = int((tasks_df["status"] != "Work Completed").sum()) if "status" in tasks_df.columns else 0
+        overdue = int(((tasks_df["due_date"] < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df["status"] != "Work Completed")).sum()) if "due_date" in tasks_df.columns and "status" in tasks_df.columns else 0
 
         with col1:
             st.metric("Total Tasks", total_tasks)
@@ -968,31 +982,35 @@ if st.session_state.role == "Admin":
         st.divider()
         st.subheader("📋 All Tasks Overview")
         users_df = get_users_df()
-        detailed_df = tasks_df.merge(
-            users_df[["username", "full_name"]],
-            left_on="assigned_to",
-            right_on="username",
-            how="left"
-        ).copy()
-        detailed_df = detailed_df.rename(columns={
-            "description": "task_description",
-            "full_name": "employee_name",
-            "dept": "department",
-            "timestamp": "assigned_date",
-            "emp_remark": "employee_remark"
-        })
-        detailed_df = detailed_df[[
-            "id",
-            "task_description",
-            "employee_name",
-            "department",
-            "status",
-            "priority",
-            "frequency",
-            "due_date",
-            "assigned_date",
-            "employee_remark"
-        ]].sort_values("id", ascending=False)
+        
+        if not tasks_df.empty and not users_df.empty and "assigned_to" in tasks_df.columns and "username" in users_df.columns:
+            detailed_df = tasks_df.merge(
+                users_df[["username", "full_name"]],
+                left_on="assigned_to",
+                right_on="username",
+                how="left"
+            ).copy()
+            detailed_df = detailed_df.rename(columns={
+                "description": "task_description",
+                "full_name": "employee_name",
+                "dept": "department",
+                "timestamp": "assigned_date",
+                "emp_remark": "employee_remark"
+            })
+            detailed_df = detailed_df[[
+                "id",
+                "task_description",
+                "employee_name",
+                "department",
+                "status",
+                "priority",
+                "frequency",
+                "due_date",
+                "assigned_date",
+                "employee_remark"
+            ]].sort_values("id", ascending=False)
+        else:
+            detailed_df = pd.DataFrame()
 
         if not detailed_df.empty:
             # Display tasks with visual indicators
@@ -1021,7 +1039,7 @@ if st.session_state.role == "Admin":
                     with col_info2:
                         st.caption(f"🔄 Frequency: {row['frequency']}")
                     with col_info3:
-                        st.caption(f"📌 Assigned: {row['assigned_date'][:10]}")
+                        st.caption(f"📌 Assigned: {row['assigned_date'][:10] if row['assigned_date'] else 'N/A'}")
                     
                     if row['employee_remark']:
                         st.info(f"💬 **Employee Update:** {row['employee_remark']}")
@@ -1030,14 +1048,16 @@ if st.session_state.role == "Admin":
         
         st.divider()
         st.subheader("📍 Department-wise Task Summary")
-        dept_summary = tasks_df.groupby("dept").agg(
-            total_tasks=("id", "count"),
-            completed=("status", lambda s: int((s == "Work Completed").sum())),
-            pending=("status", lambda s: int((s != "Work Completed").sum())),
-            overdue=("due_date", lambda s: int(((s < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df.loc[s.index, "status"] != "Work Completed")).sum()))
-        ).reset_index()
-
-        st.dataframe(dept_summary, use_container_width=True, hide_index=True)
+        if not tasks_df.empty and "dept" in tasks_df.columns:
+            dept_summary = tasks_df.groupby("dept").agg(
+                total_tasks=("id", "count"),
+                completed=("status", lambda s: int((s == "Work Completed").sum())),
+                pending=("status", lambda s: int((s != "Work Completed").sum())),
+                overdue=("due_date", lambda s: int(((s < datetime.now().date().strftime("%Y-%m-%d")) & (tasks_df.loc[s.index, "status"] != "Work Completed")).sum()))
+            ).reset_index()
+            st.dataframe(dept_summary, use_container_width=True, hide_index=True)
+        else:
+            st.info("No department metrics available.")
 
     with tab5:
         col_add, col_rem = st.columns(2)
@@ -1066,7 +1086,9 @@ if st.session_state.role == "Admin":
 
         with col_rem:
             st.subheader("🗑️ Remove Employee")
-            emp_list_df = get_employee_rows()[["username", "full_name", "dept"]].copy()
+            emp_list_df = get_employee_rows()
+            if not emp_list_df.empty:
+                emp_list_df = emp_list_df[["username", "full_name", "dept"]].copy()
 
             if emp_list_df.empty:
                 st.info("No employees found in database.")
@@ -1194,7 +1216,10 @@ elif st.session_state.role == "Employee":
 
                     col_status, col_upload = st.columns(2)
                     with col_status:
-                        new_status = st.selectbox("Update Status", ["Pending", "In Progress", "Work Completed"], key=f"s_{row['id']}")
+                        # Fixed index selection to prevent resetting previous progress values
+                        status_options = ["Pending", "In Progress", "Work Completed"]
+                        status_index = status_options.index(row['status']) if row['status'] in status_options else 0
+                        new_status = st.selectbox("Update Status", status_options, index=status_index, key=f"s_{row['id']}")
                         remark = st.text_area("Notes", value=row.get('emp_remark', ''), key=f"r_{row['id']}")
                     with col_upload:
                         proof_file = st.file_uploader("📎 Upload Proof/Attachments - Multiple Files",
