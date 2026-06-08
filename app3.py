@@ -48,7 +48,7 @@ if HAS_SUPABASE_PKG:
                     os.getenv("SUPABASE_BUCKET", "attachments")
                 ).strip() or "attachments"
             else:
-                SUPABASE_ENABLED = True  # Enforce setup execution parameters
+                SUPABASE_ENABLED = False
     except Exception as e:
         st.warning(f"Supabase client initialization failed: {e}")
 
@@ -565,8 +565,8 @@ def display_pdf(pdf_path):
 # ====================== ATTRACTIVE UI/UX STYLING ======================
 st.set_page_config(page_title="SunSys ERP", page_icon="☀️", layout="wide")
 
-if not SUPABASE_ENABLED:
-    st.info("Supabase not enabled — running in local SQLite mode. To enable Supabase, set `SUPABASE_URL` and `SUPABASE_KEY` in Streamlit secrets and install the `supabase` package.")
+# Local SQLite mode is supported and the app will still work without Supabase.
+# The banner is intentionally hidden to avoid confusion when Supabase is not configured.
 
 st.markdown("""
     <style>
@@ -601,6 +601,53 @@ st.markdown("""
     }
     
     .stDataFrame { font-size: 18px !important; }
+
+    @media (prefers-color-scheme: dark),
+    body[data-theme="dark"] {
+        color: #e2e8f0 !important;
+        background-color: #0f1724 !important;
+    }
+
+    @media (prefers-color-scheme: dark),
+    body[data-theme="dark"] .main-header,
+    body[data-theme="dark"] .card,
+    body[data-theme="dark"] .live-time,
+    body[data-theme="dark"] .stAlert,
+    body[data-theme="dark"] .stInfo,
+    body[data-theme="dark"] .stWarning,
+    body[data-theme="dark"] .stError,
+    body[data-theme="dark"] .stSuccess,
+    body[data-theme="dark"] .css-1d391kg,
+    body[data-theme="dark"] .css-1y4p8pa,
+    body[data-theme="dark"] .css-1oe6wy3,
+    body[data-theme="dark"] .css-1etv3o4,
+    body[data-theme="dark"] .css-1v3fvcr,
+    body[data-theme="dark"] .css-9s5bis,
+    body[data-theme="dark"] .css-1kyxreq {
+        background-color: rgba(15, 23, 40, 0.95) !important;
+        color: #e2e8f0 !important;
+        border-color: #334155 !important;
+    }
+
+    @media (prefers-color-scheme: dark),
+    body[data-theme="dark"] .stText,
+    body[data-theme="dark"] .stMarkdown,
+    body[data-theme="dark"] .stCaption,
+    body[data-theme="dark"] .stMetricLabel,
+    body[data-theme="dark"] .stMetricValue,
+    body[data-theme="dark"] .stButton>button,
+    body[data-theme="dark"] .stTextInput input,
+    body[data-theme="dark"] .stTextArea textarea,
+    body[data-theme="dark"] .stSelectbox select,
+    body[data-theme="dark"] .stMultiSelect select {
+        color: #e2e8f0 !important;
+    }
+
+    @media (prefers-color-scheme: dark),
+    body[data-theme="dark"] .stButton>button {
+        background: linear-gradient(90deg, #2563eb, #f59e0b) !important;
+        color: #ffffff !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -610,8 +657,8 @@ import streamlit.components.v1 as components
 col1, col2, col3 = st.columns([1.2, 3.5, 2.2])
 
 with col1:
-    if os.path.exists("sunsys logo.jpeg"):
-        st.image("sunsys logo.jpeg", width=200)
+    if os.path.exists("sunsys logo.png"):
+        st.image("sunsys logo.png", width=200)
     else:
         st.title("☀️ SunSys")
 
