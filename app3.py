@@ -11,7 +11,7 @@ import json
 import secrets
 import hashlib
 import urllib.request
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import quote, urlparse, urlunparse
 
 # Supabase initialization
 try:
@@ -652,7 +652,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ====================== HEADER WITH LIVE TIME & DATE ======================
-import streamlit.components.v1 as components
 
 col1, col2, col3 = st.columns([1.2, 3.5, 2.2])
 
@@ -666,8 +665,7 @@ with col2:
     st.markdown('<div class="main-header"><h1>SunSys ERP Portal</h1></div>', unsafe_allow_html=True)
 
 with col3:
-    components.html(
-        """
+    clock_html = """
         <div style="
             background: rgba(28, 70, 148, 0.05); 
             padding: 15px; 
@@ -691,9 +689,9 @@ with col3:
             setInterval(updateClock, 1000);
             updateClock();
         </script>
-        """,
-        height=110,
-    )
+        """
+    clock_url = "data:text/html;charset=utf-8," + quote(clock_html)
+    st.iframe(clock_url, height=110)
 
 # ====================== AUTHENTICATION ======================
 if "auth" not in st.session_state:
